@@ -1,0 +1,96 @@
+PROGRAM PLC_PRG
+VAR
+    // --- INPUTS (Simulated or via Modbus/OPC UA from ESP32) ---
+    rPowerProduction : REAL;  // [W] Solar power production
+    rPowerConsumption : REAL; // [W] Home power consumption
+
+    // --- BATTERY PARAMETERS ---
+    rBatteryCapacityWh : REAL := 5000.0; // [Wh] Total battery capacity
+    rMaxChargePower : REAL := 3000.0;    // [W] Maximum charging power limit
+    rMaxDischargePower: REAL := 3000.0;  // [W] Maximum discharging power limit
+    
+    // --- INTERNAL VARIABLES ---
+    rBatteryEnergyWh : REAL := 2500.0;   // [Wh] Initial energy (Starting at 50% SoC)
+    rPowerBalance : REAL;                // [W] Difference between production and consumption
+    rDeltaTimeHours : REAL := 0.1 / 3600.0; // Integration time step (Assuming 100ms task cycle)
+
+    // --- OUTPUTS (For HMI Visualization) ---
+    rPowerBattery : REAL;  // [W] Positive = Charging, Negative = Discharging
+    rPowerGrid : REAL;     // [W] Positive = Exporting to grid, Negative = Importing from grid
+    rBatterySoC : REAL;    // [%] State of Charge (0-100%)
+    
+    // --- STATUS INDICATORS (Alarms and States) ---
+    xBatteryLow : BOOL;      // TRUE when battery is below 20%
+    xBatteryFull : BOOL;     // TRUE when battery is above 95%
+    xCharging : BOOL;        // TRUE when battery is actively charging
+    xDischarging : BOOL;     // TRUE when battery is actively discharging
+    xGridImport : BOOL;      // TRUE when importing power from the grid
+END_VAR
+
+// ==============================================================================
+// 1. CALCULATE POWER BALANCE
+// Positive = excess solar energy, Negative = energy deficit (need more power)
+// ==============================================================================
+rPowerBalance := rPowerProduction - rPowerConsumption;
+
+// ==============================================================================
+// 2. BATTERY MANAGEMENT LOGIC
+// ==============================================================================
+IF rPowerBalance > 0.0 THEN
+    // Excess energy available -> CHARGE BATTERY
+    // Limit the charging power to the hardware maximum
+    rPowerBattery := MIN(rPowerBalance, rMaxChargePower);
+    
+    // Safeguard: Stop charging if battery is 100% full
+    IF rBatterySoC >= 100.0 THEN
+        rPowerBattery := 0.0;
+    END_IF
+    
+ELSE
+    // Energy deficit -> DISCHARGE BATTERY (rPowerBalance is negative)
+    // Limit the discharging power (using MAX since values are negative)
+    rPowerBattery := MAX(rPowerBalance, -rMaxDischargePower);
+    
+    // Safeguard: Stop discharging if battery is completely empty
+    IF rBatterySoC <= 0.0 THEN
+        rPowerBattery := 0.0;
+    END_IF
+END_IF
+
+// ==============================================================================
+// 3. GRID INTERACTION
+// The power grid acts as a buffer, covering whatever the battery cannot supply or absorb
+// ==============================================================================
+rPowerGrid := rPowerBalance - rPowerBattery;
+
+// ==============================================================================
+// 4. VIRTUAL BATTERY INTEGRATION
+// Mathematical integration: Energy [Wh] = Power [W] * Time [h]
+// ==============================================================================
+rBatteryEnergyWh := rBatteryEnergyWh + (rPowerBattery * rDeltaTimeHours);
+
+// Enforce physical battery bounds (Clamp between 0 and Max Capacity)
+IF rBatteryEnergyWh > rBatteryCapacityWh THEN
+    rBatteryEnergyWh := rBatteryCapacityWh;
+ELSIF rBatteryEnergyWh < 0.0 THEN
+    rBatteryEnergyWh := 0.0;
+END_IF
+
+// ==============================================================================
+// 5. STATE OF CHARGE (SoC) CALCULATION
+// ==============================================================================
+rBatterySoC := (rBatteryEnergyWh / rBatteryCapacityWh) * 100.0;
+
+// ==============================================================================
+// 6. HMI INDICATOR LIGHTS LOGIC
+// ==============================================================================
+// Alarms
+xBatteryLow := (rBatterySoC < 20.0);
+xBatteryFull := (rBatterySoC > 95.0);
+
+// Status indicators (Using a 1.0W deadband to prevent UI flickering around zero)
+xCharging := (rPowerBattery > 1.0);
+xDischarging := (rPowerBattery < -1.0);
+
+// Grid status (Illuminates when taking more than 1W from the grid)
+xGridImport := (rPowerGrid < -1.0);
